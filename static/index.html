@@ -1,17 +1,76 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>字幕本地化质检</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>影视字幕本地化质检</h1><p>示例项目已含术语表。分配翻译、时间轴和复核人员后，录入带时间点的字幕与评论，再完成提交、复核、锁定和交付。</p>
-<div class="card"><h2>身份与版本</h2><input id="user" value="alice"><select id="role"><option>owner</option><option>reviewer</option><option>translator</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button><pre id="data">等待刷新…</pre></div>
-<div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px;color:#222}
+input,select,textarea,button{padding:7px;margin:3px}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}
+button{cursor:pointer}
+small{color:#667}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #d9e1e8;padding:6px 8px;text-align:left;vertical-align:top}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;color:#fff}
+.ok{background:#2e8b57}.bad{background:#c0392b}.none{background:#8a94a6}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+</style></head>
+<body><h1>影视字幕本地化质检</h1>
+<p>复核签署按句绑定：确认时记下当时的文本与时间轴摘要，之后只有被改动的句子失效。交付会逐句核对当前摘要，缺少有效签署的句号会被列出并停止交付。</p>
+<div class="card"><h2>身份与版本</h2><input id="user" value="alice"><select id="role"><option>owner</option><option>reviewer</option><option>translator</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button></div>
+
+<div class="card"><h2>录入/修改字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
+
 <div class="card"><h2>时间点评论</h2><input id="time" type="number" value="1200"><input id="comment" value="请复核这里的术语"><button onclick="addComment()">添加评论</button><pre id="commentResult"></pre></div>
+
+<div class="card"><h2>逐句复核签署</h2>
+<p><small>仅复核阶段可签。签署记录当前文本与时间轴摘要；同一批次重发不会产生两份签署。</small></p>
+<label>字幕 ID（逗号分隔，留空配合“签署全部”） <input id="signIds" style="width:220px" placeholder="例如 1,2,3"></label>
+<label>批次 Key（可恢复） <input id="batchKey" style="width:180px" placeholder="例如 batch-20260930-1"></label>
+<button onclick="sign(false)">签署指定句</button>
+<button onclick="sign(true)">签署全部</button>
+<pre id="signResult"></pre>
+<h3>签署状态</h3>
+<div id="sigTable">等待刷新…</div>
+</div>
+
 <div class="card"><h2>状态流转</h2><button onclick="action('submit')">提交复核</button><button onclick="review('approve')">复核通过</button><button onclick="review('reject')">退回修改</button><button onclick="action('lock')">锁定</button><button onclick="action('deliver')">交付</button><pre id="stateResult"></pre></div>
+
+<div class="card"><h2>原始数据</h2><pre id="data">等待刷新…</pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
-async function saveCue(){try{cueResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/cues',{method:'POST',headers:auth(),body:cue.value}),null,2)}catch(e){cueResult.textContent=e.message}}
+async function saveCue(){try{cueResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/cues',{method:'POST',headers:auth(),body:cue.value}),null,2);refresh()}catch(e){cueResult.textContent=e.message}}
 async function addComment(){try{commentResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/comments',{method:'POST',headers:auth(),body:JSON.stringify({time_ms:+time.value,body:comment.value})}),null,2)}catch(e){commentResult.textContent=e.message}}
+async function sign(all){
+  const ids=signIds.value.split(',').map(s=>+s.trim()).filter(n=>Number.isInteger(n)&&n>0);
+  const payload={batch_key:batchKey.value.trim()||undefined};
+  if(all){payload.all=true}else{payload.cue_ids=ids}
+  try{signResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/signatures',{method:'POST',headers:auth(),body:JSON.stringify(payload)}),null,2);refresh()}
+  catch(e){signResult.textContent=e.message}
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function renderSignatures(cues,sigs){
+  const byCue={};sigs.forEach(s=>byCue[s.cue_id]=s);
+  if(!cues.length){sigTable.textContent='（该版本暂无字幕）';return}
+  let html='<table><tr><th>句号</th><th>字幕 ID</th><th>当前时间轴</th><th>签署状态</th><th>复核人 / 时间</th><th>失效原因</th></tr>';
+  cues.forEach(c=>{
+    const s=byCue[c.id];
+    let badge,reason;
+    if(!s){badge='<span class="badge none">未签署</span>';reason='—'}
+    else if(s.matches_current){badge='<span class="badge ok">有效</span>';reason='—'}
+    else{badge='<span class="badge bad">已失效</span>';reason=esc(s.invalid_reason||'字幕在签署后被修改')}
+    html+=`<tr><td>${c.cue_index}</td><td>${c.id}</td><td class="mono">${c.start_ms}–${c.end_ms}</td><td>${badge}</td><td>${s?esc(s.reviewer)+'<br><small>'+esc(s.signed_at)+'</small>':'—'}</td><td>${reason}</td></tr>`;
+  });
+  sigTable.innerHTML=html+'</table>';
+}
 async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
 async function review(decision){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/review',{method:'POST',headers:auth(),body:JSON.stringify({decision,comment:''})}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
-async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}}
+async function refresh(){
+  try{
+    const base='/api/versions/'+version.value;
+    const [p,v,c,cm,s,d]=await Promise.all(['/api/projects','/api/versions',base+'/cues',base+'/comments',base+'/signatures','/api/deliveries'].map(call));
+    renderSignatures(c.cues,s.signatures);
+    data.textContent=JSON.stringify({version:v,current_version:c.cues,signatures:s.signatures,comments:cm,deliveries:d},null,2);
+  }catch(e){sigTable.textContent=e.message;data.textContent=e.message}
+}
+refresh();
 </script></body></html>

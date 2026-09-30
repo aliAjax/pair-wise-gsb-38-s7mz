@@ -20,6 +20,33 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Signatures bind to this summary of a cue. Any post-confirmation edit to the
+# text or the timeline changes the digest, so only the touched cue is
+# invalidated instead of the whole version being implicitly re-signed.
+def cue_digests(cue_index: int, start_ms: int, end_ms: int, text: str) -> dict[str, str]:
+    text_digest = hashlib.sha256(f"text:{text}".encode("utf-8")).hexdigest()
+    timeline_digest = hashlib.sha256(
+        f"timeline:{cue_index}:{start_ms}:{end_ms}".encode("utf-8")
+    ).hexdigest()
+    content_digest = hashlib.sha256(
+        f"{text_digest}|{timeline_digest}".encode("utf-8")
+    ).hexdigest()
+    return {"text": text_digest, "timeline": timeline_digest, "content": content_digest}
+
+
+def invalidation_reason(signature: sqlite3.Row, cue_index: int, start_ms: int,
+                        end_ms: int, text: str) -> str:
+    digests = cue_digests(cue_index, start_ms, end_ms, text)
+    changes: list[str] = []
+    if signature["text_digest"] != digests["text"]:
+        changes.append("文本在签署后被修改")
+    if signature["signed_cue_index"] != cue_index:
+        changes.append("句号在签署后被调整")
+    if signature["signed_start_ms"] != start_ms or signature["signed_end_ms"] != end_ms:
+        changes.append("时间轴在签署后被调整")
+    return "；".join(changes) or "字幕在签署后被修改"
+
+
 class DomainError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -113,6 +140,36 @@ class Database:
                     comment TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cue_signatures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    cue_id INTEGER NOT NULL REFERENCES cues(id) ON DELETE CASCADE,
+                    reviewer TEXT NOT NULL,
+                    signed_cue_index INTEGER NOT NULL,
+                    signed_start_ms INTEGER NOT NULL,
+                    signed_end_ms INTEGER NOT NULL,
+                    signed_text TEXT NOT NULL,
+                    text_digest TEXT NOT NULL,
+                    timeline_digest TEXT NOT NULL,
+                    content_digest TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'valid'
+                        CHECK(status IN ('valid','invalid')),
+                    invalid_reason TEXT NOT NULL DEFAULT '',
+                    signed_at TEXT NOT NULL,
+                    invalidated_at TEXT,
+                    UNIQUE(version_id,cue_id)
+                );
+                CREATE TABLE IF NOT EXISTS sign_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    batch_key TEXT NOT NULL,
+                    reviewer TEXT NOT NULL,
+                    requested TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'completed'
+                        CHECK(status IN ('completed')),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(version_id,batch_key)
+                );
                 CREATE TABLE IF NOT EXISTS deliveries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     version_id INTEGER NOT NULL UNIQUE REFERENCES versions(id),
@@ -133,6 +190,80 @@ class Database:
                 );
                 """
             )
+            self._upgrade(conn)
+
+    # Legacy databases only held a version-wide approval (reviews row +
+    # approved/locked status). Promote those approvals into per-cue
+    # signatures built from current content; for already delivered versions
+    # rebuild the signed summary from the delivery snapshot instead, so the
+    # signatures describe exactly what left the door.
+    def _upgrade(self, conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA user_version=2")
+        approved_statuses = ("approved", "locked", "delivered", "superseded")
+        versions = conn.execute(
+            f"SELECT id,status FROM versions WHERE status IN ({','.join('?' for _ in approved_statuses)})",
+            approved_statuses,
+        ).fetchall()
+        now = utcnow()
+        for version in versions:
+            version_id = int(version["id"])
+            if conn.execute(
+                "SELECT 1 FROM cue_signatures WHERE version_id=? LIMIT 1", (version_id,)
+            ).fetchone():
+                continue
+            review = conn.execute(
+                "SELECT reviewer,created_at FROM reviews WHERE version_id=? AND decision='approve' ORDER BY id DESC LIMIT 1",
+                (version_id,),
+            ).fetchone()
+            reviewer = review["reviewer"] if review else "legacy-reviewer"
+            signed_at = review["created_at"] if review else now
+            rows: list[tuple[Any, ...]] = []
+            delivery = conn.execute(
+                "SELECT manifest,created_at FROM deliveries WHERE version_id=?", (version_id,)
+            ).fetchone()
+            if delivery:
+                manifest = json.loads(delivery["manifest"])
+                for cue in manifest.get("cues", []):
+                    # The manifest stores content but no cue id; reconnect it to
+                    # the live cue by cue index. Legacy versions could not be
+                    # edited after approval, so the index still points to it.
+                    live = conn.execute(
+                        "SELECT id FROM cues WHERE version_id=? AND cue_index=?",
+                        (version_id, int(cue["cue_index"])),
+                    ).fetchone()
+                    if not live:
+                        continue
+                    digests = cue_digests(int(cue["cue_index"]), int(cue["start_ms"]),
+                                          int(cue["end_ms"]), cue["text"])
+                    rows.append((
+                        version_id, int(live["id"]), reviewer,
+                        int(cue["cue_index"]), int(cue["start_ms"]), int(cue["end_ms"]),
+                        cue["text"], digests["text"], digests["timeline"], digests["content"],
+                        signed_at,
+                    ))
+            else:
+                for cue in conn.execute("SELECT * FROM cues WHERE version_id=?", (version_id,)).fetchall():
+                    digests = cue_digests(int(cue["cue_index"]), int(cue["start_ms"]),
+                                          int(cue["end_ms"]), cue["text"])
+                    rows.append((
+                        version_id, int(cue["id"]), reviewer,
+                        int(cue["cue_index"]), int(cue["start_ms"]), int(cue["end_ms"]),
+                        cue["text"], digests["text"], digests["timeline"], digests["content"],
+                        signed_at,
+                    ))
+            for row in rows:
+                conn.execute(
+                    """INSERT OR IGNORE INTO cue_signatures(
+                        version_id,cue_id,reviewer,signed_cue_index,signed_start_ms,signed_end_ms,
+                        signed_text,text_digest,timeline_digest,content_digest,
+                        status,invalid_reason,signed_at,invalidated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,'valid','',?,NULL)""",
+                    row,
+                )
+            if rows:
+                self._audit(conn, reviewer, "signatures.backfilled", "version", version_id,
+                            {"source": "delivery_snapshot" if delivery else "current_content",
+                             "count": len(rows)})
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -248,12 +379,29 @@ class Database:
             if row["source_term"] in text and row["required_translation"] not in text:
                 raise DomainError(f"术语 {row['source_term']} 必须使用指定译法 {row['required_translation']}")
 
+    def _invalidate_signature(self, conn: sqlite3.Connection, cue_id: int,
+                              cue_index: int, start_ms: int, end_ms: int, text: str) -> bool:
+        signature = conn.execute(
+            "SELECT * FROM cue_signatures WHERE cue_id=? AND status='valid'", (cue_id,)
+        ).fetchone()
+        if not signature:
+            return False
+        digests = cue_digests(cue_index, start_ms, end_ms, text)
+        if signature["content_digest"] == digests["content"]:
+            return False
+        reason = invalidation_reason(signature, cue_index, start_ms, end_ms, text)
+        conn.execute(
+            "UPDATE cue_signatures SET status='invalid',invalid_reason=?,invalidated_at=? WHERE id=?",
+            (reason, utcnow(), signature["id"]),
+        )
+        return True
+
     def save_cue(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             version = self._version(conn, version_id)
-            if version["status"] != "draft":
-                raise DomainError("只有草稿版本可以修改字幕", 409)
+            if version["status"] not in {"draft", "review"}:
+                raise DomainError("只有草稿或复核中的版本可以修改字幕", 409)
             if not self._can_edit(conn, version, actor):
                 raise DomainError("没有该版本的翻译或时间轴权限", 403)
             expected = payload.get("expected_revision")
@@ -284,16 +432,29 @@ class Database:
             index_owner = conn.execute("SELECT * FROM cues WHERE version_id=? AND cue_index=? AND id<>?", (version_id, cue_index, int(cue_id or -1))).fetchone()
             if index_owner:
                 raise DomainError("字幕序号已被使用", 409)
+            invalidated = False
+            invalid_reason = ""
             if existing:
                 conn.execute("UPDATE cues SET cue_index=?,start_ms=?,end_ms=?,text=?,updated_by=?,updated_at=? WHERE id=?", (cue_index, start_ms, end_ms, text, actor, utcnow(), existing["id"]))
                 saved_id = existing["id"]
+                if self._invalidate_signature(conn, saved_id, cue_index, start_ms, end_ms, text):
+                    invalidated = True
+                    invalid_reason = conn.execute(
+                        "SELECT invalid_reason FROM cue_signatures WHERE cue_id=?", (saved_id,)
+                    ).fetchone()["invalid_reason"]
             else:
                 cur = conn.execute("INSERT INTO cues(version_id,cue_index,start_ms,end_ms,text,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)", (version_id, cue_index, start_ms, end_ms, text, actor, utcnow()))
                 saved_id = cur.lastrowid
             revision = int(version["revision"]) + 1
             conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, utcnow(), version_id))
-            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision})
-        return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision}
+            self._audit(conn, actor, "cue.saved", "version", version_id,
+                        {"cue_id": saved_id, "revision": revision,
+                         "signature_invalidated": invalidated, "invalid_reason": invalid_reason})
+        return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {
+            "version_revision": revision,
+            "signature_status": "invalid" if invalidated else "none",
+            "invalid_reason": invalid_reason,
+        }
 
     def add_comment(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         body = str(payload.get("body", "")).strip()
@@ -327,6 +488,123 @@ class Database:
             self._audit(conn, actor, "version.submitted", "version", version_id, {})
         return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
 
+    def _require_reviewer(self, conn: sqlite3.Connection, version: sqlite3.Row, actor: str) -> None:
+        assigned = conn.execute(
+            "SELECT 1 FROM assignments WHERE version_id=? AND user=? AND role='reviewer'",
+            (version["id"], actor),
+        ).fetchone()
+        if not assigned and actor != version["owner"]:
+            raise DomainError("没有该版本的复核权限", 403)
+        if actor == version["created_by"]:
+            raise DomainError("创建人不能复核自己的版本", 403)
+
+    def _missing_valid_signatures(self, conn: sqlite3.Connection, version_id: int) -> list[dict[str, int]]:
+        cues = conn.execute(
+            "SELECT id,cue_index FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)
+        ).fetchall()
+        missing: list[dict[str, int]] = []
+        for cue in cues:
+            signature = conn.execute(
+                "SELECT content_digest FROM cue_signatures WHERE version_id=? AND cue_id=? AND status='valid'",
+                (version_id, cue["id"]),
+            ).fetchone()
+            current = conn.execute(
+                "SELECT cue_index,start_ms,end_ms,text FROM cues WHERE id=?", (cue["id"],)
+            ).fetchone()
+            digests = cue_digests(int(current["cue_index"]), int(current["start_ms"]),
+                                  int(current["end_ms"]), current["text"])
+            if not signature or signature["content_digest"] != digests["content"]:
+                missing.append({"cue_id": int(cue["id"]), "cue_index": int(cue["cue_index"])})
+        return missing
+
+    def sign_cues(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = self._version(conn, version_id)
+            if version["status"] != "review":
+                raise DomainError("只有复核中的版本可以逐句签署", 409)
+            self._require_reviewer(conn, version, actor)
+
+            cue_ids = payload.get("cue_ids")
+            all_cues = bool(payload.get("all"))
+            if not all_cues:
+                if not isinstance(cue_ids, list) or not cue_ids:
+                    raise DomainError("请指定要签署的字幕 cue_ids，或提交 all=true")
+                try:
+                    target_ids = [int(cid) for cid in cue_ids]
+                except (TypeError, ValueError) as exc:
+                    raise DomainError("字幕 ID 必须是整数") from exc
+                if len(set(target_ids)) != len(target_ids):
+                    raise DomainError("同一次确认不能重复包含同一句字幕")
+            else:
+                target_ids = [
+                    int(r["id"]) for r in conn.execute(
+                        "SELECT id FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)
+                    ).fetchall()
+                ]
+                if not target_ids:
+                    raise DomainError("空版本没有可签署的字幕", 409)
+
+            batch_key = payload.get("batch_key")
+            if batch_key is not None:
+                batch_key = str(batch_key).strip() or None
+            if batch_key:
+                # Resumable batch: a stable key means a crashed client can
+                # re-post the same list. Re-running the upsert never yields a
+                # second signature because (version_id,cue_id) is unique.
+                conn.execute(
+                    "INSERT OR IGNORE INTO sign_batches(version_id,batch_key,reviewer,requested,status,created_at) VALUES(?,?,?,?, 'completed', ?)",
+                    (version_id, batch_key, actor,
+                     json.dumps(target_ids, ensure_ascii=False), utcnow()),
+                )
+
+            now = utcnow()
+            signed: list[int] = []
+            already: list[int] = []
+            for cue_id in target_ids:
+                cue = conn.execute(
+                    "SELECT * FROM cues WHERE id=? AND version_id=?", (cue_id, version_id)
+                ).fetchone()
+                if not cue:
+                    raise DomainError(f"字幕 {cue_id} 不属于该版本", 404)
+                digests = cue_digests(int(cue["cue_index"]), int(cue["start_ms"]),
+                                      int(cue["end_ms"]), cue["text"])
+                existing = conn.execute(
+                    "SELECT * FROM cue_signatures WHERE version_id=? AND cue_id=?",
+                    (version_id, cue_id),
+                ).fetchone()
+                if existing:
+                    if existing["status"] == "valid" and existing["content_digest"] == digests["content"]:
+                        already.append(int(cue["cue_index"]))
+                        continue
+                    conn.execute(
+                        """UPDATE cue_signatures SET reviewer=?,signed_cue_index=?,signed_start_ms=?,
+                           signed_end_ms=?,signed_text=?,text_digest=?,timeline_digest=?,content_digest=?,
+                           status='valid',invalid_reason='',signed_at=?,invalidated_at=NULL WHERE id=?""",
+                        (actor, cue["cue_index"], cue["start_ms"], cue["end_ms"], cue["text"],
+                         digests["text"], digests["timeline"], digests["content"], now, existing["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO cue_signatures(version_id,cue_id,reviewer,signed_cue_index,
+                           signed_start_ms,signed_end_ms,signed_text,text_digest,timeline_digest,
+                           content_digest,status,invalid_reason,signed_at,invalidated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?, 'valid', '', ?, NULL)""",
+                        (version_id, cue_id, actor, cue["cue_index"], cue["start_ms"], cue["end_ms"],
+                         cue["text"], digests["text"], digests["timeline"], digests["content"], now),
+                    )
+                signed.append(int(cue["cue_index"]))
+            self._audit(conn, actor, "cues.signed", "version", version_id,
+                        {"signed": signed, "already_signed": already, "batch_key": batch_key})
+            missing = self._missing_valid_signatures(conn, version_id)
+        return {
+            "version_id": version_id,
+            "signed_cue_indexes": signed,
+            "already_signed_cue_indexes": already,
+            "remaining_cue_indexes": [m["cue_index"] for m in missing],
+            "batch_key": batch_key,
+        }
+
     def review(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         decision = str(payload.get("decision", "")).strip()
         if decision not in {"approve", "reject"}:
@@ -336,11 +614,20 @@ class Database:
             version = self._version(conn, version_id)
             if version["status"] != "review":
                 raise DomainError("版本当前不在复核阶段", 409)
-            assigned = conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=? AND role='reviewer'", (version_id, actor)).fetchone()
-            if not assigned and actor != version["owner"]:
-                raise DomainError("没有该版本的复核权限", 403)
-            if actor == version["created_by"]:
-                raise DomainError("创建人不能复核自己的版本", 403)
+            self._require_reviewer(conn, version, actor)
+            if decision == "approve":
+                # Gate the version-wide approval on current per-cue summaries.
+                # Because save and approve both take an immediate write lock,
+                # a translator saving in parallel is serialized with this
+                # check: an edit either lands first and its cue shows up here,
+                # or waits until approval commits. A signature can never cover
+                # stale content that still reaches delivery.
+                missing = self._missing_valid_signatures(conn, version_id)
+                if missing:
+                    raise DomainError(
+                        "以下句号缺少与当前内容一致的有效签署，无法整版通过: "
+                        + ", ".join(str(m["cue_index"]) for m in missing), 409
+                    )
             conn.execute("INSERT INTO reviews(version_id,reviewer,decision,comment,created_at) VALUES(?,?,?,?,?)", (version_id, actor, decision, str(payload.get("comment", "")), utcnow()))
             status = "approved" if decision == "approve" else "draft"
             conn.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?", (status, utcnow(), version_id))
@@ -368,7 +655,36 @@ class Database:
                 raise DomainError("只有批准或锁定版本可以交付", 409)
             if conn.execute("SELECT 1 FROM deliveries WHERE version_id=?", (version_id,)).fetchone():
                 raise DomainError("该版本已经交付，不能用新内容覆盖", 409)
-            cues = [dict(r) for r in conn.execute("SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,))]
+            # Per-cue delivery gate: recompute the current summary for every
+            # cue and demand a valid signature bound to that exact summary.
+            missing: list[int] = []
+            cue_rows = conn.execute(
+                "SELECT * FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)
+            ).fetchall()
+            for cue in cue_rows:
+                digests = cue_digests(int(cue["cue_index"]), int(cue["start_ms"]),
+                                      int(cue["end_ms"]), cue["text"])
+                signature = conn.execute(
+                    "SELECT content_digest FROM cue_signatures WHERE version_id=? AND cue_id=? AND status='valid'",
+                    (version_id, cue["id"]),
+                ).fetchone()
+                if not signature or signature["content_digest"] != digests["content"]:
+                    missing.append(int(cue["cue_index"]))
+            if missing:
+                raise DomainError(
+                    "以下句号缺少与当前内容一致的有效签署，已停止交付: "
+                    + ", ".join(str(i) for i in missing), 409
+                )
+            cues: list[dict[str, Any]] = []
+            for cue in cue_rows:
+                digests = cue_digests(int(cue["cue_index"]), int(cue["start_ms"]),
+                                      int(cue["end_ms"]), cue["text"])
+                cues.append({
+                    "cue_id": cue["id"], "cue_index": cue["cue_index"],
+                    "start_ms": cue["start_ms"], "end_ms": cue["end_ms"], "text": cue["text"],
+                    "content_digest": digests["content"],
+                    "text_digest": digests["text"], "timeline_digest": digests["timeline"],
+                })
             glossary = [dict(r) for r in conn.execute("SELECT source_term,required_translation,forbidden_terms FROM glossaries WHERE project_id=? ORDER BY source_term", (version["project_id"],))]
             manifest = {"project_id": version["project_id"], "version_id": version_id, "language": version["language"], "version_no": version["version_no"], "cues": cues, "glossary": glossary}
             snapshot_hash = hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -398,6 +714,40 @@ class Database:
     def list_cues(self, version_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)).fetchall()]
+
+    def list_signatures(self, version_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.id,s.version_id,s.cue_id,s.reviewer,s.status,s.invalid_reason,
+                       s.signed_at,s.invalidated_at,s.signed_cue_index,s.signed_start_ms,
+                       s.signed_end_ms,s.signed_text,s.text_digest,s.timeline_digest,s.content_digest,
+                       c.cue_index AS current_cue_index,c.start_ms AS current_start_ms,
+                       c.end_ms AS current_end_ms,c.text AS current_text
+                FROM cue_signatures s
+                JOIN cues c ON c.id=s.cue_id
+                WHERE s.version_id=?
+                ORDER BY c.cue_index
+                """,
+                (version_id,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for r in rows:
+                current_digests = cue_digests(int(r["current_cue_index"]), int(r["current_start_ms"]),
+                                              int(r["current_end_ms"]), r["current_text"])
+                matches = r["status"] == "valid" and r["content_digest"] == current_digests["content"]
+                item = dict(r)
+                item.pop("current_text", None)
+                item["matches_current"] = matches
+                if r["status"] == "valid" and not matches:
+                    # Defensive: a valid row that no longer matches gets a
+                    # readable reason so the page can always explain itself.
+                    item["invalid_reason"] = invalidation_reason(
+                        r, int(r["current_cue_index"]), int(r["current_start_ms"]),
+                        int(r["current_end_ms"]), r["current_text"]
+                    )
+                result.append(item)
+            return result
 
     def list_comments(self, version_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -473,6 +823,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "signatures":
+                return self._send({"signatures": self.db.list_signatures(int(parts[2]))})
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
@@ -495,6 +847,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.save_cue(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send(self.db.add_comment(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "signatures":
+                return self._send(self.db.sign_cues(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "lock", "deliver"}:
                 version_id = int(parts[2])
                 if parts[3] == "submit":
